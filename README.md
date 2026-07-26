@@ -47,6 +47,26 @@ tdl get <URL1> <URL2>
 tdl get https://tidal.com/browse/album/129835816 https://tidal.com/browse/album/147102710  
 ```
 
+### Playlists
+
+List playlists created by the authenticated user:
+
+```sh
+tdl playlists
+```
+
+Filter playlist titles with a case-insensitive substring, or use `*` and `?`
+for whole-title glob matching. `--match` is an alias for `--filter`.
+
+```sh
+tdl playlists --filter "DJ -"
+tdl playlists --filter "DJ -*"
+tdl playlists --match "DJ - 202? -*"
+```
+
+Quoting the pattern prevents the shell from expanding wildcards. Redundant
+shell escapes, such as `"DJ\ -\*"`, are accepted as well.
+
 
 ### Autocomplete
 
@@ -72,6 +92,10 @@ The `download_paths` section in config is used to decide where files will be pla
 Each of the following keys will create a nested folder structure in the following template:
 `{base_path}/{artist}/{album}/{track}`
 
+Playlist downloads can use their own flat folder and track templates:
+`{base_path}/{playlist}/{playlist_track}`. This keeps playlist order independent of
+the track's position on its original album.
+
 
 Examples: 
 
@@ -81,6 +105,8 @@ base_path = '$HOME/Music'
 artist = '{artist_name}'
 album = '{album_name} [{album_id}] [{album_release_year}]'
 track = '{track_num} - {track_name} - {track_volume}'
+playlist = '{playlist_name}'
+playlist_track = '{playlist_num} - {artist_name} - {track_name}'
 ```
 Resulting Naming path:
 `/Users/username/Music/100 gecs/1000 gecs [129835816] [2019]/1 - 745 sticky - 1.flac`
@@ -133,6 +159,8 @@ Track:
   | `{track_isrc}` | International Standard Recording Code of track | DEZ750500205
   | `{track_explicit}` | Shortcode if album is explicit, empty if false  | E
   | `{track_quality}` | String literal of `audio_quality` | HI_RES
+  | `{playlist_name}` | Playlist title for playlist downloads | DJ - 2026 - 07
+  | `{playlist_num}` | Position in the playlist, padded to at least two digits | 01
 
 
 ### audio_quality

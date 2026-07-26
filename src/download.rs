@@ -2,7 +2,7 @@ use crate::api::{models::*, TidalClient, CLIENT};
 use crate::config::CONFIG;
 
 use crate::models::*;
-use anyhow::{anyhow, Error};
+use anyhow::{anyhow, Context, Error};
 use futures::Future;
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use log::{debug, info};
@@ -60,7 +60,7 @@ pub async fn dispatch_downloads(
             let res = match action.kind {
                 ActionKind::Track => {
                     let channel = task.worker_channel.clone();
-                    let job = Box::pin(task.download_track(id));
+                    let job = Box::pin(task.download_track(id, None));
                     match channel.send(job).await {
                         Ok(_) => Ok(true),
                         Err(_) => Err(anyhow!("Error submitting track to worker queue")),
@@ -72,7 +72,7 @@ pub async fn dispatch_downloads(
             };
             match res {
                 Ok(_) => {}
-                Err(e) => eprint!("{e}"),
+                Err(e) => eprintln!("{e:#}"),
             };
         });
 
@@ -90,6 +90,12 @@ pub struct DownloadTask {
     pub client: Arc<TidalClient>,
 }
 
+#[derive(Clone)]
+struct PlaylistContext {
+    name: String,
+    position: usize,
+}
+
 impl DownloadTask {
     async fn download_artist(&self, id: String) -> Result<bool, Error> {
         self.progress.println("Getting Artist Albums")?;
@@ -103,13 +109,24 @@ impl DownloadTask {
 
     async fn download_list(&self, kind: ActionKind, id: String) -> Result<bool, Error> {
         let url = format!("https://api.tidal.com/v1/{kind}s/{id}/items",);
+        let playlist_name = match kind {
+            ActionKind::Playlist => Some(self.client.media.get_playlist(&id).await?.title),
+            _ => None,
+        };
         let tracks = self
             .client
             .media
             .get_items::<ItemResponseItem<Track>>(&url, None, None)
             .await?;
-        for track in tracks {
-            let future = Box::pin(self.clone().download_track(track.item.id.to_string()));
+        for (index, track) in tracks.into_iter().enumerate() {
+            let playlist = playlist_name.as_ref().map(|name| PlaylistContext {
+                name: name.clone(),
+                position: index + 1,
+            });
+            let future = Box::pin(
+                self.clone()
+                    .download_track(track.item.id.to_string(), playlist),
+            );
             match self.clone().worker_channel.send(future).await {
                 Ok(_) => continue,
                 Err(_) => return Err(anyhow!("Error Submitting download_track")),
@@ -118,11 +135,27 @@ impl DownloadTask {
         Ok(true)
     }
 
-    async fn download_track(self, id: String) -> Result<bool, Error> {
-        let track = self.client.media.get_track(&id).await?;
+    async fn download_track(
+        self,
+        id: String,
+        playlist: Option<PlaylistContext>,
+    ) -> Result<bool, Error> {
+        let mut track = self.client.media.get_track(&id).await?;
+        if let Some(playlist) = playlist {
+            track.playlist = Some(playlist.name);
+            track.track_number_on_playlist = Some(playlist.position);
+        }
         let path_str = self.get_path(&track).await?;
-        let download = Box::pin(self.clone().download_file(track, path_str));
-        match &self.dl_channel.send(download).await {
+        let progress = self.progress.clone();
+        let dl_channel = self.dl_channel.clone();
+        let download = Box::pin(async move {
+            let result = self.download_file(track, path_str).await;
+            if let Err(error) = &result {
+                let _ = progress.println(format!("Download Failed | {error:#}"));
+            }
+            result
+        });
+        match &dl_channel.send(download).await {
             Ok(_) => Ok(true),
             Err(_) => Err(anyhow!("Submitting Download Task failed")),
         }
@@ -131,7 +164,12 @@ impl DownloadTask {
     async fn download_file(self, track: Track, mut path: PathBuf) -> Result<bool, anyhow::Error> {
         let info = track.get_info();
         let pb = ProgressBar::new(self.progress.clone(), track.id);
-        let playback_manifest = self.client.media.get_stream_url(track.id).await?;
+        let playback_manifest = self
+            .client
+            .media
+            .get_stream_url(track.id)
+            .await
+            .with_context(|| format!("{info} | unable to obtain requested stream"))?;
         path.set_extension(
             playback_manifest
                 .get_file_extension()
@@ -159,7 +197,16 @@ impl DownloadTask {
                 .ok_or_else(|| anyhow!("Parent Directory missing somehow"))?,
         )
         .await?;
-        let file = File::create(path.clone()).await?;
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("audio");
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("download");
+        let partial_path = path.with_file_name(format!("{stem}.part.{extension}"));
+        let file = File::create(partial_path.clone()).await?;
         // 1 MiB Write buffer to minimize syscalls for slow i/o
         // Reduces write CPU time from 24% to 7%.
         let mut writer = tokio::io::BufWriter::with_capacity(1024 * 1000 * 1000, file);
@@ -175,9 +222,20 @@ impl DownloadTask {
         //flush buffer to disk;
         pb.set_message(format!("Writing to Disk | {info}"));
         writer.flush().await?;
+        writer.into_inner().sync_all().await?;
 
         pb.set_message(format!("Writing metadata | {info}"));
-        self.write_metadata(track, path).await?;
+        self.write_metadata(track, partial_path.clone())
+            .await
+            .with_context(|| {
+                format!(
+                    "{info} | metadata write failed for {}",
+                    partial_path.display()
+                )
+            })?;
+        tokio::fs::rename(&partial_path, &path)
+            .await
+            .with_context(|| format!("{info} | unable to finalize {}", path.display()))?;
         pb.println(format!("Download Complete | {info}"));
 
         Ok(true)
@@ -193,7 +251,10 @@ impl DownloadTask {
         tag.set_vorbis("COPYRIGHT", vec![track.copyright]);
         tag.set_vorbis("ISRC", vec![track.isrc]);
         if let Some(cover_id) = &track.album.cover {
-            let cover = self.get_cover_data(path.clone(), cover_id).await?;
+            let download_cover = CONFIG.read().await.download_cover;
+            let cover = self
+                .get_cover_data(path.clone(), cover_id, download_cover)
+                .await?;
             tag.add_picture(cover.content_type, CoverFront, cover.data);
         }
 
@@ -202,22 +263,21 @@ impl DownloadTask {
         Ok(())
     }
 
-    pub async fn get_cover_data(&self, path: PathBuf, cover_id: &str) -> Result<Cover, Error> {
+    pub async fn get_cover_data(
+        &self,
+        path: PathBuf,
+        cover_id: &str,
+        download_cover: bool,
+    ) -> Result<Cover, Error> {
         let dl_path = Path::new(&path)
             .parent()
             .ok_or_else(|| anyhow!("Parent Directory Doesn't exist"))?
             .join("cover.jpg");
-        if dl_path.exists() {
-            let cover = Cover {
-                content_type: "application/jpeg".to_string(),
-                data: tokio::fs::read(dl_path).await?,
-            };
-            return Ok(cover);
-        }
-
         let pic = self.client.media.get_cover_data(cover_id).await?;
-        tokio::fs::write(dl_path, pic.data.clone()).await?;
-        info!("Write cover to disk");
+        if download_cover {
+            tokio::fs::write(dl_path, pic.data.clone()).await?;
+            info!("Write cover to disk");
+        }
         Ok(pic)
     }
 
@@ -237,7 +297,12 @@ impl DownloadTask {
             self.client.media.get_artist(&artist_id)
         )?;
 
-        dl_path.get_track_path(track.clone(), album, artist)
+        let path_artist = if track.playlist.is_some() {
+            track.artist.clone()
+        } else {
+            artist
+        };
+        dl_path.get_track_path(track.clone(), album, path_artist)
     }
 }
 

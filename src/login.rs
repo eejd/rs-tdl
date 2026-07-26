@@ -32,7 +32,7 @@ pub async fn login() -> TidalClient {
                 debug!("Login sucessful");
                 return v;
             }
-            Err(e) => eprintln!("{e}"),
+            Err(e) => eprintln!("{e:#}"),
         }
     }
 
@@ -45,23 +45,33 @@ pub async fn login_web(client: AuthClient) -> Result<TidalClient, Error> {
     let prompt = show_prompt(code.clone(), now);
 
     while now.elapsed().as_secs() <= code.expires_in {
-        let login = client.check_auth_status(&code.device_code).await;
-        if login.is_err() {
-            sleep(Duration::from_secs(code.interval)).await;
-            continue;
-        }
+        let login_results = match client.check_auth_status(&code.device_code).await {
+            Ok(login_results) => login_results,
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("authorization_pending") || message.contains("slow_down") {
+                    sleep(Duration::from_secs(code.interval)).await;
+                    continue;
+                }
+                hide_prompt(prompt);
+                return Err(error.context("TIDAL device authorization failed"));
+            }
+        };
         hide_prompt(prompt);
         let timestamp = chrono::Utc::now().timestamp();
         {
             let mut config = CONFIG.write().await;
-            //login will not be error if this is reached.
-            let login_results = login?;
+            let user = match login_results.user {
+                Some(user) => user,
+                None => client.get_session(&login_results.access_token).await?,
+            };
             config.login_key.device_code = Some(code.device_code);
             config.login_key.access_token = Some(login_results.access_token);
             config.login_key.refresh_token = login_results.refresh_token;
             config.login_key.expires_after = Some(login_results.expires_in + timestamp);
-            config.login_key.user_id = Some(login_results.user.user_id);
-            config.login_key.country_code = Some(login_results.user.country_code);
+            config.login_key.user_id = Some(user.user_id);
+            config.login_key.country_code = Some(user.country_code);
+            config.login_key.session_id = user.session_id;
             config.save()?;
         }
         return Ok(TidalClient::new(&*CONFIG.read().await));
@@ -77,8 +87,17 @@ pub async fn login_config(client: AuthClient) -> Result<TidalClient, Error> {
     if let Some(access_token) = config.login_key.access_token.as_ref() {
         debug!("Attempting to validate access token");
         if client.verify_access_token(access_token).await? {
+            let session = client.get_session(access_token).await?;
+            drop(config);
+            {
+                let mut config = CONFIG.write().await;
+                config.login_key.user_id = Some(session.user_id);
+                config.login_key.country_code = Some(session.country_code);
+                config.login_key.session_id = session.session_id;
+                config.save()?;
+            }
             println!("Access Token Valid");
-            return Ok(TidalClient::new(&*config));
+            return Ok(TidalClient::new(&*CONFIG.read().await));
         }
     }
 
@@ -91,7 +110,11 @@ pub async fn login_config(client: AuthClient) -> Result<TidalClient, Error> {
         {
             let mut config = CONFIG.write().await;
             config.login_key.expires_after = Some(refresh.expires_in + now);
-            config.login_key.access_token = Some(refresh.access_token);
+            config.login_key.access_token = Some(refresh.access_token.clone());
+            let session = client.get_session(&refresh.access_token).await?;
+            config.login_key.user_id = Some(session.user_id);
+            config.login_key.country_code = Some(session.country_code);
+            config.login_key.session_id = session.session_id;
             debug!("Attempting to save access token");
             config.save().expect("Failed to Save Access Token");
             println!("Access Token Refreshed with Refresh Token");

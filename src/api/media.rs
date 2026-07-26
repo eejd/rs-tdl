@@ -24,13 +24,29 @@ impl Deref for MediaClient {
 
 impl MediaClient {
     pub async fn get_track(&self, id: &str) -> Result<Track, Error> {
-        let url = format!("{}/tracks/{}", &self.api_base, id);
+        let url = format!("{}/tracks/{}", self.api_base, id);
         self.get::<Track>(&url, None).await
     }
 
     pub async fn get_album(&self, id: usize) -> Result<Album, Error> {
-        let url = format!("{}/albums/{}", &self.api_base, id);
+        let url = format!("{}/albums/{}", self.api_base, id);
         self.get::<Album>(&url, None).await
+    }
+
+    pub async fn get_playlist(&self, id: &str) -> Result<Playlist, Error> {
+        let url = format!("https://api.tidal.com/v1/playlists/{id}");
+        self.get::<Playlist>(&url, None).await
+    }
+
+    pub async fn get_user_playlists(&self) -> Result<Vec<PlaylistSummary>, Error> {
+        let session = self
+            .get::<UserResponse>("https://api.tidal.com/v1/sessions", None)
+            .await?;
+        let url = format!(
+            "https://api.tidal.com/v1/users/{}/playlists",
+            session.user_id
+        );
+        self.get_items::<PlaylistSummary>(&url, None, None).await
     }
 
     pub async fn get_artist(&self, id: &str) -> Result<Artist, Error> {
@@ -38,7 +54,7 @@ impl MediaClient {
         self.get::<Artist>(&url, None).await
     }
     pub async fn get_stream_url(&self, id: usize) -> Result<PlaybackManifest, Error> {
-        let url = format!("{}/tracks/{}/playbackinfopostpaywall", &self.api_base, id);
+        let url = format!("{}/tracks/{}/playbackinfopostpaywall", self.api_base, id);
         let query = &[
             ("audioquality".to_string(), self.audio_quality.to_string()),
             ("playbackmode".to_string(), PlaybackMode::Stream.to_string()),
@@ -48,12 +64,34 @@ impl MediaClient {
             ),
         ];
 
+        // Playback manifests contain short-lived signed URLs and must never be
+        // served from the persistent metadata cache.
         let req = self
-            .get::<PlaybackInfoPostPaywallRes>(&url, Some(query))
+            .get_uncached::<PlaybackInfoPostPaywallRes>(&url, Some(query))
             .await?;
 
         match req.manifest_mime_type.as_str() {
-            "application/vnd.tidal.bts" => Ok(PlaybackManifest::from_str(&req.manifest)?),
+            "application/vnd.tidal.bts" => {
+                let manifest = PlaybackManifest::from_str(&req.manifest)?;
+                let requested = self.audio_quality;
+                let returned = req.audio_quality;
+                let codec = manifest.codecs.to_ascii_lowercase();
+                let requested_lossless =
+                    matches!(requested, AudioQuality::Lossless | AudioQuality::HiRes);
+                let returned_lossless =
+                    matches!(returned, AudioQuality::Lossless | AudioQuality::HiRes)
+                        && (codec.contains("flac") || codec.contains("alac"));
+
+                if requested_lossless && !returned_lossless {
+                    return Err(anyhow!(
+                        "TIDAL quality downgrade: requested {requested}, returned {returned} ({}/{})",
+                        manifest.mime_type,
+                        manifest.codecs
+                    ));
+                }
+
+                Ok(manifest)
+            }
             _ => Err(Error::msg("Incorrect Mimetype on Response")),
         }
     }

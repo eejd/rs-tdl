@@ -52,6 +52,8 @@ pub struct LoginKey {
     pub device_code: Option<String>,
     pub user_id: Option<i64>,
     #[serde_as(as = "NoneAsEmptyString")]
+    pub session_id: Option<String>,
+    #[serde_as(as = "NoneAsEmptyString")]
     pub country_code: Option<String>,
     #[serde_as(as = "NoneAsEmptyString")]
     pub access_token: Option<String>,
@@ -67,7 +69,12 @@ pub struct ApiKey {
 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DownloadPathSettings {
+    /// Root used for playlist downloads.
     pub base_path: String,
+    /// Root used for direct track, album, and artist downloads.
+    pub artist_base_path: String,
+    pub playlist: String,
+    pub playlist_track: String,
     pub artist: String,
     pub album: String,
     pub track: String,
@@ -78,7 +85,7 @@ impl DownloadPathSettings {
         Ok(Path::new("").join(shellexpand::full(&self.base_path)?.to_string()))
     }
     pub fn get_artist_path(&self, artist: Artist) -> Result<PathBuf, anyhow::Error> {
-        let base = &self.get_base_path()?;
+        let base = Path::new("").join(shellexpand::full(&self.artist_base_path)?.to_string());
         Ok(base.join(artist.replace_path(&self.artist)))
     }
     pub fn get_album_path(&self, album: Album, artist: Artist) -> Result<PathBuf, anyhow::Error> {
@@ -92,6 +99,14 @@ impl DownloadPathSettings {
         album: Album,
         artist: Artist,
     ) -> Result<PathBuf, anyhow::Error> {
+        if track.playlist.is_some() {
+            let base = &self.get_base_path()?;
+            let playlist = track.clone().replace_path(&self.playlist);
+            let path = track.replace_path(&self.playlist_track);
+            let path = album.replace_path(&path);
+            return Ok(base.join(playlist).join(artist.replace_path(&path)));
+        }
+
         let base = &self.get_album_path(album.clone(), artist.clone())?;
         let mut path = track.replace_path(&self.track);
         path = album.replace_path(&path);
@@ -231,6 +246,8 @@ static TRACK_TOKEN_MAP: phf::Map<&'static str, TrackTokens> = phf_map! {
    "{track_isrc}" => TrackTokens::ISRC,
    "{track_explicit}" => TrackTokens::Explicit,
    "{track_quality}" => TrackTokens::AudioQuality,
+   "{playlist_name}" => TrackTokens::PlaylistName,
+   "{playlist_num}" => TrackTokens::PlaylistNumber,
 };
 
 #[derive(Clone, Copy)]
@@ -243,7 +260,47 @@ pub enum TrackTokens {
     ISRC,
     Explicit,
     AudioQuality,
+    PlaylistName,
+    PlaylistNumber,
 }
+
+fn format_playlist_number(number: Option<usize>) -> String {
+    number
+        .map(|value| format!("{value:02}"))
+        .unwrap_or_default()
+}
+
+fn format_track_number(number: usize) -> String {
+    format!("{number:02}")
+}
+
+fn normalize_dj_playlist_month(title: &str) -> String {
+    let parts: Vec<&str> = title.split(" - ").collect();
+    if parts.len() != 3 || parts[0] != "DJ" || parts[1].len() != 4 {
+        return title.to_string();
+    }
+    if !parts[1].chars().all(|character| character.is_ascii_digit()) {
+        return title.to_string();
+    }
+
+    let month = match parts[2].to_ascii_lowercase().as_str() {
+        "jan" => "01",
+        "feb" => "02",
+        "mar" => "03",
+        "apr" => "04",
+        "may" => "05",
+        "jun" => "06",
+        "jul" => "07",
+        "aug" => "08",
+        "sep" => "09",
+        "oct" => "10",
+        "nov" => "11",
+        "dec" => "12",
+        _ => return title.to_string(),
+    };
+    format!("DJ - {} - {month}", parts[1])
+}
+
 impl TokenMap<Track> for TrackTokens {
     fn token_map() -> &'static phf::Map<&'static str, Self> {
         &TRACK_TOKEN_MAP
@@ -254,7 +311,7 @@ impl TokenMap<Track> for TrackTokens {
             TrackTokens::ID => v.id.to_string(),
             TrackTokens::Title => v.title.clone(),
             TrackTokens::Duration => v.duration.to_string(),
-            TrackTokens::TrackNumber => v.track_number.to_string(),
+            TrackTokens::TrackNumber => format_track_number(v.track_number),
             TrackTokens::VolumeNumber => v.volume_number.to_string(),
             TrackTokens::ISRC => v.isrc.to_string(),
             TrackTokens::Explicit => match v.explicit {
@@ -262,6 +319,12 @@ impl TokenMap<Track> for TrackTokens {
                 false => String::new(),
             },
             TrackTokens::AudioQuality => v.audio_quality.to_string(),
+            TrackTokens::PlaylistName => v
+                .playlist
+                .as_deref()
+                .map(normalize_dj_playlist_month)
+                .unwrap_or_default(),
+            TrackTokens::PlaylistNumber => format_playlist_number(v.track_number_on_playlist),
         };
         sanitize(a)
     }
@@ -275,6 +338,7 @@ pub fn get_config() -> Result<Settings, Error> {
         .set_default("progress_refresh_rate", 5)?
         .set_default("login_key.device_code", "")?
         .set_default("login_key.country_code", "")?
+        .set_default("login_key.session_id", "")?
         .set_default("download_cover", true)?
         .set_default("downloads", 3)?
         .set_default("workers", 1)?
@@ -288,12 +352,21 @@ pub fn get_config() -> Result<Settings, Error> {
             "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=",
         )?
         .set_default("download_paths.base_path", "$HOME/Music")?
+        .set_default("download_paths.artist_base_path", "$HOME/Music")?
+        .set_default("download_paths.playlist", "{playlist_name}")?
+        .set_default(
+            "download_paths.playlist_track",
+            "{playlist_num} - {artist_name} - {track_name}",
+        )?
         .set_default("download_paths.artist", "{artist_name}")?
         .set_default(
             "download_paths.album",
             "{album_name} [{album_id}] [{album_release_year}] ",
         )?
-        .set_default("download_paths.track", "{track_num} - {track_name}")?
+        .set_default(
+            "download_paths.track",
+            "{track_num} - {artist_name} - {track_name}",
+        )?
         .add_source(File::new(CONFIG_FILE.as_str(), FileFormat::Toml).required(false))
         .build()?;
     let settings: Settings = config.try_deserialize()?;
@@ -320,4 +393,45 @@ lazy_static::lazy_static! {
    pub static ref CONFIG_HOME: String = get_config_dir();
    pub static ref CONFIG_FILE: String = get_config_file();
    pub static ref CONFIG: RwLock<Settings> = RwLock::new(get_config().expect("Unable to get configuration"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_playlist_number, format_track_number, normalize_dj_playlist_month};
+
+    #[test]
+    fn playlist_numbers_are_zero_padded_to_two_digits() {
+        assert_eq!(format_playlist_number(Some(1)), "01");
+        assert_eq!(format_playlist_number(Some(9)), "09");
+        assert_eq!(format_playlist_number(Some(10)), "10");
+        assert_eq!(format_playlist_number(Some(119)), "119");
+        assert_eq!(format_playlist_number(None), "");
+    }
+
+    #[test]
+    fn album_track_numbers_are_zero_padded_to_two_digits() {
+        assert_eq!(format_track_number(1), "01");
+        assert_eq!(format_track_number(10), "10");
+        assert_eq!(format_track_number(101), "101");
+    }
+
+    #[test]
+    fn single_dj_month_names_are_normalized_for_vault_sorting() {
+        assert_eq!(
+            normalize_dj_playlist_month("DJ - 2025 - Oct"),
+            "DJ - 2025 - 10"
+        );
+        assert_eq!(
+            normalize_dj_playlist_month("DJ - 2023 - Apr-May"),
+            "DJ - 2023 - Apr-May"
+        );
+        assert_eq!(
+            normalize_dj_playlist_month("DJ - 2026 - 01"),
+            "DJ - 2026 - 01"
+        );
+        assert_eq!(
+            normalize_dj_playlist_month("DJ - Classics"),
+            "DJ - Classics"
+        );
+    }
 }

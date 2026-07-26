@@ -5,7 +5,8 @@ use tabled::Tabled;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct RefreshResponse {
-    pub user: UserResponse,
+    #[serde(default)]
+    pub user: Option<UserResponse>,
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub token_type: String,
@@ -17,6 +18,8 @@ pub struct RefreshResponse {
 pub struct UserResponse {
     pub user_id: i64,
     pub country_code: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -43,6 +46,12 @@ pub struct DeviceAuthRequest {
     pub grant_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_code: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct OAuthErrorResponse {
+    pub error: String,
+    pub sub_status: Option<i64>,
 }
 
 impl Default for DeviceAuthRequest {
@@ -189,7 +198,7 @@ pub struct Track {
     #[tabled(skip)]
     pub playlist: Option<String>,
     #[tabled(skip)]
-    pub mixes: TrackMix,
+    pub mixes: Option<TrackMix>,
 }
 
 impl Track {
@@ -215,14 +224,31 @@ pub struct TrackMix {
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all(deserialize = "camelCase"))]
 pub struct Playlist {
+    #[serde(default)]
     uuid: String,
-    title: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
     number_of_tracks: usize,
+    #[serde(default)]
     number_of_videos: usize,
-    creator: PlaylistCreator,
+    #[serde(default)]
+    creator: Option<PlaylistCreator>,
+    #[serde(default)]
     description: String,
+    #[serde(default)]
     duration: usize,
+    #[serde(default)]
     promoted_artists: Vec<Artist>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all(deserialize = "camelCase"))]
+pub struct PlaylistSummary {
+    pub uuid: String,
+    pub title: String,
+    #[serde(default)]
+    pub number_of_tracks: usize,
 }
 impl Named for Playlist {
     fn get_name(&self) -> &str {
@@ -232,7 +258,9 @@ impl Named for Playlist {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PlaylistCreator {
+    #[serde(default)]
     id: usize,
+    #[serde(default)]
     name: String,
     #[serde(alias = "type")]
     creator_type: Option<String>,
@@ -277,7 +305,7 @@ impl FromStr for PlaybackManifest {
     }
 }
 
-#[derive(SerializeDisplay, DeserializeFromStr, Clone, Debug, Copy)]
+#[derive(SerializeDisplay, DeserializeFromStr, Clone, Debug, Copy, PartialEq, Eq)]
 ///LOW(96kbps AAC)
 ///HIGH(320kbps AAC)
 ///LOSSLESS(1411kbps|16bit/44.1kHz FLAC/ALAC)
@@ -326,6 +354,49 @@ impl clap::ValueEnum for AudioQuality {
             Self::High => Some(clap::PossibleValue::new("high")),
             Self::Low => Some(clap::PossibleValue::new("low")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Playlist, RefreshResponse, TrackMix};
+
+    #[test]
+    fn token_response_accepts_missing_legacy_user_object() {
+        let response: RefreshResponse = serde_json::from_str(
+            r#"{
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "token_type": "Bearer",
+                "expires_in": 86400
+            }"#,
+        )
+        .expect("token response should deserialize");
+
+        assert!(response.user.is_none());
+    }
+
+    #[test]
+    fn playlist_accepts_sparse_creator_metadata() {
+        let playlist: Playlist = serde_json::from_str(
+            r#"{
+                "uuid": "aa87c7c5-e370-4ea5-a877-6213f99ba9f3",
+                "title": "DJ - 2026 - 07",
+                "numberOfTracks": 12,
+                "creator": {"id": 123}
+            }"#,
+        )
+        .expect("sparse playlist should deserialize");
+
+        assert_eq!(playlist.title, "DJ - 2026 - 07");
+        assert_eq!(playlist.number_of_tracks, 12);
+    }
+
+    #[test]
+    fn track_mix_accepts_current_api_null_value() {
+        let mixes: Option<TrackMix> =
+            serde_json::from_str("null").expect("null track mixes should deserialize");
+        assert!(mixes.is_none());
     }
 }
 

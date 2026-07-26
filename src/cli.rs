@@ -16,6 +16,7 @@ pub fn cli() -> Command<'static> {
         .about(env!("CARGO_PKG_DESCRIPTION"))
         .subcommand_required(true)
         .subcommand(get())
+        .subcommand(playlists())
         .subcommand(search())
         .subcommand(
             Command::new("login").about("Login or re-authenticates with the current access token"),
@@ -24,6 +25,21 @@ pub fn cli() -> Command<'static> {
             Command::new("logout").about("Logout via the TIDAL API and resets the login config"),
         )
         .subcommand(autocomplete())
+}
+
+fn playlists() -> Command<'static> {
+    Command::new("playlists")
+        .about("Lists playlists created by the authenticated TIDAL user")
+        .arg(
+            Arg::new("filter")
+                .short('f')
+                .long("filter")
+                .visible_alias("match")
+                .takes_value(true)
+                .value_name("pattern")
+                .value_parser(NonEmptyStringValueParser::new())
+                .help("Case-insensitive title substring or glob pattern containing * or ?"),
+        )
 }
 
 fn get() -> Command<'static> {
@@ -161,7 +177,7 @@ pub async fn parse_config_flags(matches: &ArgMatches) {
     }
 }
 
-fn set_val<'a, T>(dst: &mut T, flag: &str, matches: &'a ArgMatches)
+fn set_val<T>(dst: &mut T, flag: &str, matches: &ArgMatches)
 where
     T: Send + Sync + Copy + Clone + 'static,
 {
