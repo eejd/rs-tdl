@@ -9,6 +9,7 @@ use sanitize_filename::sanitize;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use serde_with::NoneAsEmptyString;
+use std::collections::BTreeMap;
 use std::env::var;
 use std::io::Write;
 use std::path::Path;
@@ -18,6 +19,7 @@ use tokio::sync::RwLock;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Settings {
     pub audio_quality: AudioQuality,
+    pub flac_output: FlacOutput,
     pub show_progress: bool,
     pub progress_refresh_rate: u8,
     pub include_singles: bool,
@@ -25,9 +27,21 @@ pub struct Settings {
     pub workers: u8,
     pub download_cover: bool,
     pub cache_dir: String,
+    // TOML 0.5 requires root scalar values to be emitted before tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_profile: Option<String>,
     pub download_paths: DownloadPathSettings,
     pub login_key: LoginKey,
     pub api_key: ApiKey,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub auth_profiles: BTreeMap<String, AuthProfile>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum FlacOutput {
+    Native,
+    Source,
 }
 
 impl Settings {
@@ -35,13 +49,18 @@ impl Settings {
         let config_file = get_config_file();
         let config_dir = get_config_dir();
         let cache_dir = get_cache_dir();
+        // Serialize before opening the destination so an encoding error can
+        // never truncate the user's working configuration.
+        let config_str = toml::to_string_pretty(&self)?;
 
         std::fs::create_dir_all(config_dir)?;
         std::fs::create_dir_all(cache_dir)?;
 
-        let mut file = std::fs::File::create(config_file)?;
-        let config_str = toml::to_string_pretty(&self)?;
+        let temporary_file = format!("{config_file}.tmp");
+        let mut file = std::fs::File::create(&temporary_file)?;
         file.write_all(config_str.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(temporary_file, config_file)?;
         Ok(())
     }
 }
@@ -60,12 +79,130 @@ pub struct LoginKey {
     #[serde_as(as = "NoneAsEmptyString")]
     pub refresh_token: Option<String>,
     pub expires_after: Option<i64>,
+    #[serde_as(as = "NoneAsEmptyString")]
+    pub auth_profile: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ApiKey {
     pub client_id: String,
     pub client_secret: String,
+}
+
+pub const ANDROID_AUTO_PROFILE: &str = "android-auto";
+pub const ANDROID_PKCE_PROFILE: &str = "android-pkce";
+const ANDROID_AUTO_CLIENT_ID: &str = "zU4XHVVkc2tDPo4t";
+const ANDROID_AUTO_CLIENT_SECRET: &str = "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=";
+const ANDROID_AUTO_USER_AGENT: &str = "Mozilla/5.0 (Linux; Android 12; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/91.0.4472.114 Safari/537.36";
+const ANDROID_PKCE_CLIENT_ID_PARTS: (&[u8], &[u8]) = (b"TmtKRVUxSmtjRXM=", b"NWFIRkZRbFJuVlE9PQ==");
+const ANDROID_PKCE_CLIENT_SECRET_PARTS: (&[u8], &[u8]) = (
+    b"ZUdWMVVHMVpOMjVpY0ZvNVNVbGlURUZqVVQ=",
+    b"a3pjMmhyWVRGV1RtaGxWVUZ4VGpaSlkzTjZhbFJIT0QwPQ==",
+);
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthFlow {
+    #[default]
+    Device,
+    Pkce,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AuthProfile {
+    pub client_id: String,
+    pub client_secret: String,
+    pub user_agent: String,
+    pub client_version: String,
+    #[serde(default)]
+    pub auth_flow: AuthFlow,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_type: Option<String>,
+}
+
+impl AuthProfile {
+    pub fn android_auto() -> Self {
+        Self {
+            client_id: ANDROID_AUTO_CLIENT_ID.to_string(),
+            client_secret: ANDROID_AUTO_CLIENT_SECRET.to_string(),
+            user_agent: ANDROID_AUTO_USER_AGENT.to_string(),
+            client_version: "2025.7.16".to_string(),
+            auth_flow: AuthFlow::Device,
+            platform: None,
+            device_type: None,
+        }
+    }
+
+    pub fn android_pkce() -> Result<Self, Error> {
+        Ok(Self {
+            client_id: decode_joined_base64(ANDROID_PKCE_CLIENT_ID_PARTS)?,
+            client_secret: decode_joined_base64(ANDROID_PKCE_CLIENT_SECRET_PARTS)?,
+            user_agent: ANDROID_AUTO_USER_AGENT.to_string(),
+            client_version: "2025.7.16".to_string(),
+            auth_flow: AuthFlow::Pkce,
+            platform: None,
+            device_type: None,
+        })
+    }
+
+    fn validate(&self, name: &str) -> Result<(), Error> {
+        if self.client_id.trim().is_empty()
+            || self.client_secret.trim().is_empty()
+            || self.user_agent.trim().is_empty()
+            || self.client_version.trim().is_empty()
+        {
+            anyhow::bail!(
+                "OAuth profile '{name}' must define client_id, client_secret, user_agent, and client_version"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn decode_joined_base64(parts: (&[u8], &[u8])) -> Result<String, Error> {
+    let first = base64::decode(parts.0)?;
+    let second = base64::decode(parts.1)?;
+    let joined = [first, second].concat();
+    Ok(String::from_utf8(base64::decode(joined)?)?)
+}
+
+impl LoginKey {
+    pub fn clear(&mut self) {
+        self.device_code = None;
+        self.user_id = None;
+        self.session_id = None;
+        self.country_code = None;
+        self.access_token = None;
+        self.refresh_token = None;
+        self.expires_after = None;
+        self.auth_profile = None;
+    }
+}
+
+impl Settings {
+    pub fn resolve_auth_profile(&self) -> Result<(String, AuthProfile), Error> {
+        let selected = self.auth_profile.as_deref();
+        let resolved = match selected {
+            Some(ANDROID_AUTO_PROFILE) => AuthProfile::android_auto(),
+            Some(ANDROID_PKCE_PROFILE) => AuthProfile::android_pkce()?,
+            Some(name) => self.auth_profiles.get(name).cloned().ok_or_else(|| {
+                anyhow::anyhow!("OAuth profile '{name}' is not defined in auth_profiles")
+            })?,
+            None if self.api_key.client_id == ANDROID_AUTO_CLIENT_ID
+                && self.api_key.client_secret == ANDROID_AUTO_CLIENT_SECRET =>
+            {
+                AuthProfile::android_auto()
+            }
+            None => anyhow::bail!(
+                "legacy custom OAuth credentials have no request profile; define [auth_profiles.<name>] with the matching request identity, set auth_profile = '<name>', then run `tdl login --force`"
+            ),
+        };
+        let name = selected.unwrap_or(ANDROID_AUTO_PROFILE).to_string();
+        resolved.validate(&name)?;
+        Ok((name, resolved))
+    }
 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DownloadPathSettings {
@@ -81,11 +218,20 @@ pub struct DownloadPathSettings {
 }
 
 impl DownloadPathSettings {
+    pub fn get_destination_root(&self, playlist: bool) -> Result<PathBuf, anyhow::Error> {
+        let configured = if playlist {
+            &self.base_path
+        } else {
+            &self.artist_base_path
+        };
+        Ok(Path::new("").join(shellexpand::full(configured)?.to_string()))
+    }
+
     pub fn get_base_path(&self) -> Result<PathBuf, anyhow::Error> {
-        Ok(Path::new("").join(shellexpand::full(&self.base_path)?.to_string()))
+        self.get_destination_root(true)
     }
     pub fn get_artist_path(&self, artist: Artist) -> Result<PathBuf, anyhow::Error> {
-        let base = Path::new("").join(shellexpand::full(&self.artist_base_path)?.to_string());
+        let base = self.get_destination_root(false)?;
         Ok(base.join(artist.replace_path(&self.artist)))
     }
     pub fn get_album_path(&self, album: Album, artist: Artist) -> Result<PathBuf, anyhow::Error> {
@@ -333,6 +479,7 @@ impl TokenMap<Track> for TrackTokens {
 pub fn get_config() -> Result<Settings, Error> {
     let config = Config::builder()
         .set_default("audio_quality", "HI_RES")?
+        .set_default("flac_output", "NATIVE")?
         .set_default("show_progress", true)?
         .set_default("include_singles", true)?
         .set_default("progress_refresh_rate", 5)?
@@ -346,13 +493,14 @@ pub fn get_config() -> Result<Settings, Error> {
         .set_default("login_key.access_token", "")?
         .set_default("login_key.refresh_token", "")?
         .set_default("login_key.expires_after", 0)?
+        .set_default("login_key.auth_profile", "")?
         .set_default("api_key.client_id", "zU4XHVVkc2tDPo4t")?
         .set_default(
             "api_key.client_secret",
             "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=",
         )?
-        .set_default("download_paths.base_path", "$HOME/Music")?
-        .set_default("download_paths.artist_base_path", "$HOME/Music")?
+        .set_default("download_paths.base_path", default_download_root())?
+        .set_default("download_paths.artist_base_path", default_download_root())?
         .set_default("download_paths.playlist", "{playlist_name}")?
         .set_default(
             "download_paths.playlist_track",
@@ -373,6 +521,16 @@ pub fn get_config() -> Result<Settings, Error> {
     settings.save()?;
 
     Ok(settings)
+}
+
+#[cfg(target_os = "windows")]
+fn default_download_root() -> &'static str {
+    "$USERPROFILE/Music/Tidal"
+}
+
+#[cfg(not(target_os = "windows"))]
+fn default_download_root() -> &'static str {
+    "$HOME/Music/Tidal"
 }
 
 fn get_config_dir() -> String {
@@ -397,7 +555,49 @@ lazy_static::lazy_static! {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_playlist_number, format_track_number, normalize_dj_playlist_month};
+    use super::{
+        format_playlist_number, format_track_number, normalize_dj_playlist_month, ApiKey, AuthFlow,
+        AuthProfile, DownloadPathSettings, FlacOutput, LoginKey, Settings, ANDROID_AUTO_PROFILE,
+        ANDROID_PKCE_PROFILE,
+    };
+    use crate::api::models::AudioQuality;
+    use std::collections::BTreeMap;
+
+    fn settings(api_key: ApiKey) -> Settings {
+        Settings {
+            audio_quality: AudioQuality::Lossless,
+            flac_output: FlacOutput::Native,
+            show_progress: false,
+            progress_refresh_rate: 5,
+            include_singles: true,
+            downloads: 1,
+            workers: 1,
+            download_cover: false,
+            cache_dir: String::new(),
+            download_paths: DownloadPathSettings {
+                base_path: String::new(),
+                artist_base_path: String::new(),
+                playlist: String::new(),
+                playlist_track: String::new(),
+                artist: String::new(),
+                album: String::new(),
+                track: String::new(),
+            },
+            login_key: LoginKey {
+                device_code: None,
+                user_id: None,
+                session_id: None,
+                country_code: None,
+                access_token: None,
+                refresh_token: None,
+                expires_after: None,
+                auth_profile: None,
+            },
+            api_key,
+            auth_profile: None,
+            auth_profiles: BTreeMap::new(),
+        }
+    }
 
     #[test]
     fn playlist_numbers_are_zero_padded_to_two_digits() {
@@ -433,5 +633,117 @@ mod tests {
             normalize_dj_playlist_month("DJ - Classics"),
             "DJ - Classics"
         );
+    }
+
+    #[test]
+    fn legacy_builtin_credentials_resolve_to_android_auto() {
+        let builtin = AuthProfile::android_auto();
+        let config = settings(ApiKey {
+            client_id: builtin.client_id.clone(),
+            client_secret: builtin.client_secret.clone(),
+        });
+        let (name, resolved) = config.resolve_auth_profile().unwrap();
+        assert_eq!(name, ANDROID_AUTO_PROFILE);
+        assert_eq!(resolved, builtin);
+    }
+
+    #[test]
+    fn unmatched_legacy_credentials_require_an_explicit_profile() {
+        let config = settings(ApiKey {
+            client_id: "custom".into(),
+            client_secret: "secret".into(),
+        });
+        assert!(config
+            .resolve_auth_profile()
+            .unwrap_err()
+            .to_string()
+            .contains("legacy custom"));
+    }
+
+    #[test]
+    fn named_custom_profile_resolves_its_own_identity() {
+        let mut config = settings(ApiKey {
+            client_id: "old".into(),
+            client_secret: "old".into(),
+        });
+        let profile = AuthProfile {
+            client_id: "custom".into(),
+            client_secret: "secret".into(),
+            user_agent: "Custom/1".into(),
+            client_version: "1.0".into(),
+            auth_flow: AuthFlow::Device,
+            platform: Some("WEB".into()),
+            device_type: Some("BROWSER".into()),
+        };
+        config.auth_profile = Some("mine".into());
+        config.auth_profiles.insert("mine".into(), profile.clone());
+        assert_eq!(
+            config.resolve_auth_profile().unwrap(),
+            ("mine".into(), profile)
+        );
+    }
+
+    #[test]
+    fn clearing_login_removes_all_client_bound_state() {
+        let mut login = LoginKey {
+            device_code: Some("device".into()),
+            user_id: Some(1),
+            session_id: Some("session".into()),
+            country_code: Some("US".into()),
+            access_token: Some("access".into()),
+            refresh_token: Some("refresh".into()),
+            expires_after: Some(42),
+            auth_profile: Some("old".into()),
+        };
+        login.clear();
+        assert!(login.device_code.is_none());
+        assert!(login.user_id.is_none());
+        assert!(login.session_id.is_none());
+        assert!(login.country_code.is_none());
+        assert!(login.access_token.is_none());
+        assert!(login.refresh_token.is_none());
+        assert!(login.expires_after.is_none());
+        assert!(login.auth_profile.is_none());
+    }
+
+    #[test]
+    fn selected_profile_serializes_before_toml_tables() {
+        let builtin = AuthProfile::android_auto();
+        let mut config = settings(ApiKey {
+            client_id: builtin.client_id,
+            client_secret: builtin.client_secret,
+        });
+        config.auth_profile = Some(ANDROID_AUTO_PROFILE.into());
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let decoded: Settings = toml::from_str(&serialized).unwrap();
+        assert_eq!(decoded.auth_profile.as_deref(), Some(ANDROID_AUTO_PROFILE));
+    }
+
+    #[test]
+    fn builtin_pkce_profile_resolves_with_pkce_flow() {
+        let mut config = settings(ApiKey {
+            client_id: "legacy".into(),
+            client_secret: "legacy".into(),
+        });
+        config.auth_profile = Some(ANDROID_PKCE_PROFILE.into());
+        let (name, profile) = config.resolve_auth_profile().unwrap();
+        assert_eq!(name, ANDROID_PKCE_PROFILE);
+        assert_eq!(profile.auth_flow, AuthFlow::Pkce);
+        assert!(!profile.client_id.is_empty());
+        assert!(!profile.client_secret.is_empty());
+    }
+
+    #[test]
+    fn default_download_root_is_generic_and_app_scoped() {
+        let root = super::default_download_root();
+        assert!(root.ends_with("/Music/Tidal"));
+    }
+
+    #[test]
+    fn native_flac_is_the_configured_default() {
+        let value: FlacOutput = toml::from_str("value = 'NATIVE'")
+            .and_then(|table: toml::Value| table["value"].clone().try_into())
+            .unwrap();
+        assert_eq!(value, FlacOutput::Native);
     }
 }

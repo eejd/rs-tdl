@@ -1,5 +1,5 @@
 use crate::api::{models::*, TidalClient, CLIENT};
-use crate::config::CONFIG;
+use crate::config::{FlacOutput, CONFIG};
 
 use crate::models::*;
 use anyhow::{anyhow, Context, Error};
@@ -8,7 +8,7 @@ use indicatif::{MultiProgress, ProgressDrawTarget};
 use log::{debug, info};
 use metaflac::block::PictureType::CoverFront;
 use metaflac::Tag;
-use std::cmp::min;
+use mp4ameta::{Img, ImgFmt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
@@ -164,19 +164,37 @@ impl DownloadTask {
     async fn download_file(self, track: Track, mut path: PathBuf) -> Result<bool, anyhow::Error> {
         let info = track.get_info();
         let pb = ProgressBar::new(self.progress.clone(), track.id);
+        let (destination_root, flac_output) = {
+            let config = CONFIG.read().await;
+            (
+                config
+                    .download_paths
+                    .get_destination_root(track.playlist.is_some())?,
+                config.flac_output,
+            )
+        };
+        if !destination_root.is_dir() {
+            return Err(anyhow!(
+                "{info} | configured destination root is unavailable: {}. Mount or create the intended root before downloading; tdl will not create it automatically",
+                destination_root.display()
+            ));
+        }
         let playback_manifest = self
             .client
             .media
             .get_stream_url(track.id)
             .await
             .with_context(|| format!("{info} | unable to obtain requested stream"))?;
-        path.set_extension(
+        let source_format = playback_manifest.audio_format()?;
+        let extract_native_flac =
+            source_format == AudioFormat::ContainerFlac && flac_output == FlacOutput::Native;
+        path.set_extension(if extract_native_flac {
+            "flac"
+        } else {
             playback_manifest
                 .get_file_extension()
-                .expect("Unable to determine track file extension"),
-        );
-
-        let stream_url = &playback_manifest.urls[0];
+                .expect("Unable to determine track file extension")
+        });
 
         if path.exists() {
             debug!("Path exists");
@@ -186,37 +204,50 @@ impl DownloadTask {
             return Ok(false);
         }
 
-        let response = CLIENT.get(stream_url).send().await?;
-        let total_size: u64 = response
-            .content_length()
-            .ok_or_else(|| anyhow!("Failed to get content length from {}", stream_url))?;
-        pb.start_download(total_size, &track);
-        debug!("Got Content Length: {total_size} for {}", track.get_info());
+        if playback_manifest.urls.is_empty() {
+            return Err(anyhow!("Playback manifest did not contain media URLs"));
+        }
+        let segment_count = playback_manifest.urls.len();
+        if segment_count > 1 {
+            pb.start_segmented_download(segment_count, &track);
+        }
         tokio::fs::create_dir_all(
             path.parent()
                 .ok_or_else(|| anyhow!("Parent Directory missing somehow"))?,
         )
         .await?;
-        let extension = path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("audio");
         let stem = path
             .file_stem()
             .and_then(|value| value.to_str())
             .unwrap_or("download");
-        let partial_path = path.with_file_name(format!("{stem}.part.{extension}"));
-        let file = File::create(partial_path.clone()).await?;
+        let source_extension = playback_manifest
+            .get_file_extension()
+            .expect("Unable to determine source file extension");
+        let source_partial_path = path.with_file_name(format!("{stem}.part.{source_extension}"));
+        let file = File::create(source_partial_path.clone()).await?;
         // 1 MiB Write buffer to minimize syscalls for slow i/o
         // Reduces write CPU time from 24% to 7%.
         let mut writer = tokio::io::BufWriter::with_capacity(1024 * 1000 * 1000, file);
         let mut downloaded: u64 = 0;
-        let mut stream = response.bytes_stream();
-        while let Some(item) = stream.next().await {
-            let chunk = item?;
-            downloaded = min(downloaded + (chunk.len() as u64), total_size);
-            pb.set_position(downloaded);
-            writer.write_all(&chunk).await?;
+        for (index, stream_url) in playback_manifest.urls.iter().enumerate() {
+            let response = CLIENT
+                .get(stream_url)
+                .send()
+                .await?
+                .error_for_status()
+                .with_context(|| format!("{info} | media segment request failed"))?;
+            if segment_count == 1 {
+                pb.start_download(response.content_length().unwrap_or(0), &track);
+            } else {
+                pb.set_segment(index + 1, segment_count, &track);
+            }
+            let mut stream = response.bytes_stream();
+            while let Some(item) = stream.next().await {
+                let chunk = item?;
+                downloaded += chunk.len() as u64;
+                pb.set_position(downloaded);
+                writer.write_all(&chunk).await?;
+            }
         }
 
         //flush buffer to disk;
@@ -224,16 +255,31 @@ impl DownloadTask {
         writer.flush().await?;
         writer.into_inner().sync_all().await?;
 
+        let (metadata_path, output_format) = if extract_native_flac {
+            pb.set_message(format!("Extracting native FLAC | {info}"));
+            let input = source_partial_path.clone();
+            let output = path.with_file_name(format!("{stem}.part.flac"));
+            let conversion_output = output.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::audio::convert_containerized_flac(&input, &conversion_output)
+            })
+            .await??;
+            tokio::fs::remove_file(&source_partial_path).await?;
+            (output, AudioFormat::Flac)
+        } else {
+            (source_partial_path, source_format)
+        };
+
         pb.set_message(format!("Writing metadata | {info}"));
-        self.write_metadata(track, partial_path.clone())
+        self.write_metadata(track, metadata_path.clone(), output_format)
             .await
             .with_context(|| {
                 format!(
                     "{info} | metadata write failed for {}",
-                    partial_path.display()
+                    metadata_path.display()
                 )
             })?;
-        tokio::fs::rename(&partial_path, &path)
+        tokio::fs::rename(&metadata_path, &path)
             .await
             .with_context(|| format!("{info} | unable to finalize {}", path.display()))?;
         pb.println(format!("Download Complete | {info}"));
@@ -241,24 +287,62 @@ impl DownloadTask {
         Ok(true)
     }
 
-    async fn write_metadata(&self, track: Track, path: PathBuf) -> Result<(), Error> {
-        let fp = path.clone();
-        let mut tag = tokio::task::spawn_blocking(move || Tag::read_from_path(fp)).await??;
-        tag.set_vorbis("TITLE", vec![track.title]);
-        tag.set_vorbis("TRACKNUMBER", vec![track.track_number.to_string()]);
-        tag.set_vorbis("ARTIST", vec![track.artist.name]);
-        tag.set_vorbis("ALBUM", vec![track.album.title.unwrap_or_default()]);
-        tag.set_vorbis("COPYRIGHT", vec![track.copyright]);
-        tag.set_vorbis("ISRC", vec![track.isrc]);
-        if let Some(cover_id) = &track.album.cover {
+    async fn write_metadata(
+        &self,
+        track: Track,
+        path: PathBuf,
+        audio_format: AudioFormat,
+    ) -> Result<(), Error> {
+        let cover = if let Some(cover_id) = &track.album.cover {
             let download_cover = CONFIG.read().await.download_cover;
-            let cover = self
-                .get_cover_data(path.clone(), cover_id, download_cover)
-                .await?;
-            tag.add_picture(cover.content_type, CoverFront, cover.data);
-        }
+            Some(
+                self.get_cover_data(path.clone(), cover_id, download_cover)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
-        tokio::task::spawn_blocking(move || tag.save()).await??;
+        tokio::task::spawn_blocking(move || -> Result<(), Error> {
+            match audio_format {
+                AudioFormat::Flac => {
+                    let mut tag = Tag::read_from_path(&path)?;
+                    tag.set_vorbis("TITLE", vec![track.title]);
+                    tag.set_vorbis("TRACKNUMBER", vec![track.track_number.to_string()]);
+                    tag.set_vorbis("ARTIST", vec![track.artist.name]);
+                    tag.set_vorbis("ALBUM", vec![track.album.title.unwrap_or_default()]);
+                    tag.set_vorbis("COPYRIGHT", vec![track.copyright]);
+                    tag.set_vorbis("ISRC", vec![track.isrc]);
+                    if let Some(cover) = cover {
+                        tag.add_picture(cover.content_type, CoverFront, cover.data);
+                    }
+                    tag.save()?;
+                }
+                AudioFormat::ContainerFlac | AudioFormat::Mp4Alac | AudioFormat::Mp4Aac => {
+                    let mut tag = mp4ameta::Tag::read_from_path(&path)?;
+                    tag.set_title(track.title);
+                    tag.set_track_number(
+                        u16::try_from(track.track_number)
+                            .context("track number is too large for MP4 metadata")?,
+                    );
+                    tag.set_artist(track.artist.name);
+                    tag.set_album(track.album.title.unwrap_or_default());
+                    tag.set_copyright(track.copyright);
+                    tag.set_isrc(track.isrc);
+                    if let Some(cover) = cover {
+                        let format = match cover.content_type.as_str() {
+                            "image/png" => ImgFmt::Png,
+                            "image/bmp" => ImgFmt::Bmp,
+                            _ => ImgFmt::Jpeg,
+                        };
+                        tag.set_artwork(Img::new(format, cover.data));
+                    }
+                    tag.write_to_path(&path)?;
+                }
+            }
+            Ok(())
+        })
+        .await??;
         info!("Metadata written to file");
         Ok(())
     }

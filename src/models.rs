@@ -28,6 +28,25 @@ impl ProgressBar {
                         .progress_chars("#>-"));
         self.set_message(format!("Downloading File | {}", track.get_info()));
     }
+
+    pub fn start_segmented_download(&self, segments: usize, track: &Track) {
+        self.set_style(
+            ProgressStyle::default_spinner()
+                .template("{wide_msg}\n{spinner:.green} {bytes} ({bytes_per_sec:4})")
+                .expect("Progress Bar Template is invalid"),
+        );
+        self.set_message(format!(
+            "Downloading DASH segments 0/{segments} | {}",
+            track.get_info()
+        ));
+    }
+
+    pub fn set_segment(&self, current: usize, total: usize, track: &Track) {
+        self.set_message(format!(
+            "Downloading DASH segments {current}/{total} | {}",
+            track.get_info()
+        ));
+    }
 }
 
 impl Deref for ProgressBar {

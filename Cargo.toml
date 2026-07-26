@@ -30,7 +30,11 @@ toml = "0.5.9"
 chrono = "0.4.21"
 base64 = "0.13.0"
 regex = "1.6.0"
+rand = "0.8.5"
+sha2 = "0.10.9"
+url = "2.5.4"
 metaflac = "0.2.5"
+mp4ameta = "0.13.0"
 log = "0.4.17"
 env_logger = "0.9.0"
 shellexpand = "2.1.0"
@@ -41,6 +45,10 @@ tabled = "0.8.0"
 sanitize-filename = "0.4.0"
 http-cache-reqwest = "0.5.0"
 phf = { version = "0.11", features = ["macros"] }
+quick-xml = "0.39"
+symphonia = { version = "0.5.5", features = ["all"] }
+flacenc = "0.5.1"
+num-traits = "0.2.19"
 
 [dependencies.serde_with]
 version = "2.0.0"

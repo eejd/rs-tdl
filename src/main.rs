@@ -38,8 +38,26 @@ async fn main() {
             }
         }
         Some(("search", search_matches)) => search(search_matches).await,
-        Some(("login", _)) => {
-            login().await;
+        Some(("login", login_matches)) => {
+            let profile = login_matches
+                .get_one::<String>("profile")
+                .map(String::as_str);
+            let force = login_matches.is_present("force");
+            match login_with_options(profile, force).await {
+                Ok(_) => {
+                    let selected = CONFIG
+                        .read()
+                        .await
+                        .resolve_auth_profile()
+                        .map(|(name, _)| name)
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    println!("Login successful with OAuth profile '{selected}'");
+                }
+                Err(error) => {
+                    eprintln!("Unable to login: {error:#}");
+                    std::process::exit(1);
+                }
+            }
         }
         Some(("logout", _)) => logout().await,
         Some(("autocomplete", matches)) => autocomplete(matches),
@@ -222,16 +240,33 @@ async fn search(matches: &ArgMatches) {
 }
 
 async fn logout() {
-    let config = CONFIG.read().await;
-    match config.login_key.access_token.clone() {
-        Some(token) => match AuthClient::new(config.api_key.clone())
-            .logout(token.to_owned())
-            .await
-        {
-            Ok(_) => println!("Logout Sucessful"),
-            Err(e) => eprintln!("Error Logging out: {e}"),
-        },
-        None => println!("No Auth Token is configured to logout with"),
+    let (token, profile) = {
+        let config = CONFIG.read().await;
+        (
+            config.login_key.access_token.clone(),
+            config
+                .resolve_auth_profile()
+                .ok()
+                .map(|(_, profile)| profile),
+        )
+    };
+
+    if let (Some(token), Some(profile)) = (token, profile) {
+        match AuthClient::new(profile) {
+            Ok(client) => {
+                if let Err(error) = client.logout(token).await {
+                    eprintln!("Remote logout failed: {error}");
+                }
+            }
+            Err(error) => eprintln!("Unable to create logout client: {error}"),
+        }
+    }
+
+    let mut config = CONFIG.write().await;
+    config.login_key.clear();
+    match config.save() {
+        Ok(()) => println!("Local authentication cleared"),
+        Err(error) => eprintln!("Unable to clear local authentication: {error}"),
     }
 }
 
