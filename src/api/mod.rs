@@ -28,8 +28,18 @@ lazy_static::lazy_static! {
 
 fn build_http_client() -> Client {
     reqwest::Client::builder()
-    //use the example chrome useragent from MDN Docs as tidal API's will sometimes fail without it
-    .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 Edg/91.0.864.59")
+    // Match the Android client identity associated with the current OAuth
+    // credentials. TIDAL can reject playback when credentials and client
+    // headers describe different application families.
+    .user_agent("Mozilla/5.0 (Linux; Android 12; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/91.0.4472.114 Safari/537.36")
+    .default_headers({
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-tidal-client-version",
+            reqwest::header::HeaderValue::from_static("2025.7.16"),
+        );
+        headers
+    })
     .build()
     .expect("Unable to build Reqwest Client")
 }
@@ -75,11 +85,13 @@ impl TidalClient {
 #[derive(Clone)]
 pub struct ApiClient {
     country_code: (String, String),
+    session_id: Option<(String, String)>,
     access_token: String,
     audio_quality: AudioQuality,
     include_singles: bool,
     api_base: String,
     http_client: ClientWithMiddleware,
+    uncached_http_client: Client,
 }
 
 impl ApiClient {
@@ -92,13 +104,18 @@ impl ApiClient {
                     .country_code
                     .expect("Country code is not set in config"),
             ),
+            session_id: config
+                .login_key
+                .session_id
+                .map(|value| (String::from("sessionId"), value)),
             access_token: config
                 .login_key
                 .access_token
                 .expect("Access Token is not present in config"),
             http_client: build_middleware_client(config.cache_dir),
+            uncached_http_client: build_http_client(),
             include_singles: config.include_singles,
-            api_base: String::from("https://api.tidalhifi.com/v1"),
+            api_base: String::from("https://api.tidal.com/v1"),
             audio_quality: config.audio_quality,
         })
     }
@@ -112,16 +129,71 @@ impl ApiClient {
             params.extend(query);
         }
         params.push(&self.country_code);
+        if let Some(session_id) = &self.session_id {
+            params.push(session_id);
+        }
         let req = self
             .http_client
             .get(url)
             .bearer_auth(&self.access_token)
             .query(&params);
 
-        let result = req.send().await?.text().await?;
+        let response = req.send().await?;
+        let status = response.status();
+        let result = response.text().await?;
         debug!("{}", result);
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "TIDAL API request to {url} returned {status}: {}",
+                result.chars().take(300).collect::<String>()
+            ));
+        }
         let result = serde_json::from_str::<T>(&result)?;
         Ok(result)
+    }
+
+    async fn get_uncached<'a, T>(
+        &self,
+        url: &'a str,
+        query: Option<&[(String, String)]>,
+    ) -> Result<T, Error>
+    where
+        T: DeserializeOwned + 'a,
+    {
+        let mut params = Vec::new();
+        if let Some(query) = query {
+            params.extend(query);
+        }
+        params.push(&self.country_code);
+        if let Some(session_id) = &self.session_id {
+            params.push(session_id);
+        }
+
+        let response = self
+            .uncached_http_client
+            .get(url)
+            .bearer_auth(&self.access_token)
+            .query(&params)
+            .send()
+            .await?;
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let result = response.text().await?;
+        debug!("{}", result);
+        if !status.is_success() {
+            let retry_detail = retry_after
+                .map(|value| format!("; Retry-After: {value}"))
+                .unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "TIDAL API request to {url} returned {status}{retry_detail}: {}",
+                result.chars().take(300).collect::<String>()
+            ));
+        }
+        Ok(serde_json::from_str::<T>(&result)?)
     }
 
     pub async fn get_items<'a, T>(
