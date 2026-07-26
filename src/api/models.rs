@@ -276,12 +276,50 @@ pub struct PlaybackManifest {
     pub urls: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioFormat {
+    Flac,
+    ContainerFlac,
+    Mp4Alac,
+    Mp4Aac,
+}
+
 impl PlaybackManifest {
+    pub fn audio_format(&self) -> Result<AudioFormat, anyhow::Error> {
+        let mime = self.mime_type.to_ascii_lowercase();
+        let codec = self.codecs.to_ascii_lowercase();
+        match (mime.as_str(), codec.as_str()) {
+            ("audio/flac", codec) if codec.contains("flac") => Ok(AudioFormat::Flac),
+            ("audio/mp4", codec) if codec.contains("flac") => Ok(AudioFormat::ContainerFlac),
+            ("audio/ogg" | "application/ogg", codec) if codec.contains("flac") => {
+                Ok(AudioFormat::ContainerFlac)
+            }
+            ("audio/x-matroska" | "audio/webm" | "video/webm", codec) if codec.contains("flac") => {
+                Ok(AudioFormat::ContainerFlac)
+            }
+            ("audio/mp4", codec) if codec.contains("alac") => Ok(AudioFormat::Mp4Alac),
+            ("audio/mp4", codec) if codec.contains("mp4a") || codec.contains("aac") => {
+                Ok(AudioFormat::Mp4Aac)
+            }
+            _ => anyhow::bail!(
+                "unsupported audio packaging: {}/{}",
+                self.mime_type,
+                self.codecs
+            ),
+        }
+    }
+
+    pub fn is_lossless(&self) -> Result<bool, anyhow::Error> {
+        Ok(matches!(
+            self.audio_format()?,
+            AudioFormat::Flac | AudioFormat::ContainerFlac | AudioFormat::Mp4Alac
+        ))
+    }
+
     pub fn get_file_extension(&self) -> Option<&str> {
-        match self.mime_type.as_str() {
-            "audio/mp4" => Some("m4a"),
-            "audio/flac" => Some("flac"),
-            _ => None,
+        match self.audio_format().ok()? {
+            AudioFormat::Flac => Some("flac"),
+            AudioFormat::ContainerFlac | AudioFormat::Mp4Alac | AudioFormat::Mp4Aac => Some("m4a"),
         }
     }
 }

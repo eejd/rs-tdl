@@ -25,6 +25,19 @@ To setup an auth token, run the below command, and log in via the link output to
 tdl login
 ```
 
+OAuth credentials, authorization flow, client headers, and client-specific
+query parameters are treated as one profile. For playback, use the built-in
+Android PKCE profile and discard tokens issued by a different flow:
+
+```sh
+tdl login --profile android-pkce --force
+```
+
+Access and refresh tokens are bound to the client that issued them. Changing
+profiles therefore requires authorization again. PKCE login prints a TIDAL URL;
+after signing in, paste the final `https://tidal.com/android/login/auth?...`
+redirect URL back into the terminal.
+
 To get the possible parameters for any command or sub command, run:
 
 ```
@@ -81,6 +94,65 @@ tdl autocomplete -s zsh > $FPATH/tdl.zsh
 
 Configs are stored in `~/.config/tdl/config.toml`, and will auto-generate with the default settings when the executable is ran. 
 
+Fresh configurations use the normal user music directory under a dedicated
+`Tidal` folder (`$HOME/Music/Tidal` on macOS and Unix-like systems). Personal
+mount points and storage-server paths belong only in the local config and are
+not repository defaults.
+
+### OAuth profiles
+
+The built-in `android-pkce` and legacy `android-auto` profiles require no
+additional configuration. Device-code tokens from `android-auto` may validate
+for metadata but can be rejected from playback with TIDAL sub-status `4005`, so
+`android-pkce` is recommended for downloads.
+Custom OAuth clients must declare their complete request identity instead of
+reusing the built-in Android headers:
+
+```toml
+auth_profile = "my-client"
+
+[auth_profiles.my-client]
+client_id = "..."
+client_secret = "..."
+user_agent = "..."
+client_version = "..."
+# Include these only when they belong to the selected client family.
+platform = "WEB"
+device_type = "BROWSER"
+```
+
+After adding or changing a custom profile, run
+`tdl login --profile my-client --force`. Existing legacy custom credentials
+without request-identity fields are rejected with this instruction rather than
+being silently mixed with an unrelated fingerprint.
+
+For lossless downloads, `audio/mp4` alone does not establish quality. FLAC and
+ALAC codecs are accepted as lossless; AAC-LC (`mp4a.40.2`) remains lossy and is
+rejected when `LOSSLESS` was requested.
+
+### FLAC output
+
+Containerized FLAC is converted to a normal `.flac` file by default using the
+pure-Rust Symphonia decoder and `flacenc` encoder:
+
+```toml
+flac_output = "NATIVE"
+```
+
+The conversion preserves the decoded PCM exactly, including channel layout,
+sample rate, bit depth, and sample count. Track metadata and artwork are written
+after conversion into the final FLAC. Native FLAC is never re-encoded, ALAC
+remains ALAC/M4A, and lossy codecs remain in their source format.
+
+To retain FLAC in its delivered MP4, Ogg, or Matroska container instead:
+
+```toml
+flac_output = "SOURCE"
+```
+
+Pure-Rust FLAC encoding is substantially faster in release builds than debug
+builds.
+
 ### download_paths
 
 The `download_paths` section in config is used to decide where files will be placed in the file system.
@@ -101,7 +173,8 @@ Examples:
 
 ``` toml
 [download_paths]
-base_path = '$HOME/Music'
+base_path = '$HOME/Music/Tidal'
+artist_base_path = '$HOME/Music/Tidal'
 artist = '{artist_name}'
 album = '{album_name} [{album_id}] [{album_release_year}]'
 track = '{track_num} - {track_name} - {track_volume}'
@@ -117,7 +190,8 @@ Keys can also be left blank to skip folder creation.
 
 ``` toml
 [download_paths]
-base_path = '$HOME/Music'
+base_path = '$HOME/Music/Tidal'
+artist_base_path = '$HOME/Music/Tidal'
 artist = ''
 album = '{artist_name} - {album_name} [{album_id}] [{album_release_year}]'
 track = '[{track_num}] - {artist_name} - {track_name} - {track_volume}'

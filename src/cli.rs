@@ -19,7 +19,22 @@ pub fn cli() -> Command<'static> {
         .subcommand(playlists())
         .subcommand(search())
         .subcommand(
-            Command::new("login").about("Login or re-authenticates with the current access token"),
+            Command::new("login")
+                .about("Login or re-authenticate with a complete OAuth client profile")
+                .arg(
+                    Arg::new("profile")
+                        .long("profile")
+                        .takes_value(true)
+                        .value_name("name")
+                        .value_parser(NonEmptyStringValueParser::new())
+                        .help("Select a built-in or configured OAuth profile"),
+                )
+                .arg(
+                    Arg::new("force")
+                        .long("force")
+                        .takes_value(false)
+                        .help("Clear client-bound tokens and perform device authorization"),
+                ),
         )
         .subcommand(
             Command::new("logout").about("Logout via the TIDAL API and resets the login config"),

@@ -6,6 +6,26 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::try_join;
 
+fn validate_requested_quality(
+    requested: AudioQuality,
+    returned: AudioQuality,
+    manifest: &PlaybackManifest,
+    profile_name: &str,
+) -> Result<(), Error> {
+    let requested_lossless = matches!(requested, AudioQuality::Lossless | AudioQuality::HiRes);
+    let returned_lossless = matches!(returned, AudioQuality::Lossless | AudioQuality::HiRes)
+        && manifest.is_lossless()?;
+
+    if requested_lossless && !returned_lossless {
+        return Err(anyhow!(
+            "TIDAL quality downgrade on OAuth profile '{profile_name}': requested {requested}, returned {returned} ({}/{}); AAC-LC is lossy even in an MP4 container. Relink with `tdl login --profile {profile_name} --force` if the official app offers lossless",
+            manifest.mime_type,
+            manifest.codecs,
+        ));
+    }
+    Ok(())
+}
+
 pub struct MediaClient(Arc<ApiClient>);
 
 impl MediaClient {
@@ -75,24 +95,25 @@ impl MediaClient {
                 let manifest = PlaybackManifest::from_str(&req.manifest)?;
                 let requested = self.audio_quality;
                 let returned = req.audio_quality;
-                let codec = manifest.codecs.to_ascii_lowercase();
-                let requested_lossless =
-                    matches!(requested, AudioQuality::Lossless | AudioQuality::HiRes);
-                let returned_lossless =
-                    matches!(returned, AudioQuality::Lossless | AudioQuality::HiRes)
-                        && (codec.contains("flac") || codec.contains("alac"));
-
-                if requested_lossless && !returned_lossless {
-                    return Err(anyhow!(
-                        "TIDAL quality downgrade: requested {requested}, returned {returned} ({}/{})",
-                        manifest.mime_type,
-                        manifest.codecs
-                    ));
-                }
+                validate_requested_quality(requested, returned, &manifest, &self.profile_name)?;
 
                 Ok(manifest)
             }
-            _ => Err(Error::msg("Incorrect Mimetype on Response")),
+            "application/dash+xml" => {
+                let decoded = base64::decode(&req.manifest)?;
+                let xml = String::from_utf8(decoded)?;
+                let manifest = super::dash::parse(&xml)?;
+                validate_requested_quality(
+                    self.audio_quality,
+                    req.audio_quality,
+                    &manifest,
+                    &self.profile_name,
+                )?;
+                Ok(manifest)
+            }
+            mime_type => Err(anyhow!(
+                "unsupported TIDAL playback manifest type: {mime_type}"
+            )),
         }
     }
 
@@ -141,5 +162,94 @@ impl MediaClient {
 
         let data = req.bytes().await?.to_vec();
         Ok(Cover { content_type, data })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_requested_quality;
+    use crate::api::models::{AudioFormat, AudioQuality, EncryptionType, PlaybackManifest};
+
+    fn manifest(mime_type: &str, codecs: &str) -> PlaybackManifest {
+        PlaybackManifest {
+            mime_type: mime_type.into(),
+            codecs: codecs.into(),
+            encryption_type: EncryptionType::None,
+            key_id: None,
+            urls: vec!["https://media.invalid/track".into()],
+        }
+    }
+
+    #[test]
+    fn native_flac_is_accepted_as_lossless() {
+        let value = manifest("audio/flac", "flac");
+        assert_eq!(value.audio_format().unwrap(), AudioFormat::Flac);
+        validate_requested_quality(
+            AudioQuality::Lossless,
+            AudioQuality::Lossless,
+            &value,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(value.get_file_extension(), Some("flac"));
+    }
+
+    #[test]
+    fn alac_in_mp4_is_accepted_as_lossless() {
+        let value = manifest("audio/mp4", "alac");
+        assert_eq!(value.audio_format().unwrap(), AudioFormat::Mp4Alac);
+        validate_requested_quality(
+            AudioQuality::Lossless,
+            AudioQuality::Lossless,
+            &value,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(value.get_file_extension(), Some("m4a"));
+    }
+
+    #[test]
+    fn flac_in_mp4_is_classified_for_native_extraction() {
+        let value = manifest("audio/mp4", "flac");
+        assert_eq!(value.audio_format().unwrap(), AudioFormat::ContainerFlac);
+        validate_requested_quality(
+            AudioQuality::Lossless,
+            AudioQuality::Lossless,
+            &value,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(value.get_file_extension(), Some("m4a"));
+    }
+
+    #[test]
+    fn aac_lc_is_rejected_for_a_lossless_request() {
+        let value = manifest("audio/mp4", "mp4a.40.2");
+        assert_eq!(value.audio_format().unwrap(), AudioFormat::Mp4Aac);
+        let error =
+            validate_requested_quality(AudioQuality::Lossless, AudioQuality::High, &value, "test")
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("AAC-LC is lossy"));
+        assert!(error.contains("--profile test --force"));
+    }
+
+    #[test]
+    fn contradictory_lossless_aac_manifest_is_rejected() {
+        let value = manifest("audio/mp4", "mp4a.40.2");
+        assert!(validate_requested_quality(
+            AudioQuality::Lossless,
+            AudioQuality::Lossless,
+            &value,
+            "test",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn aac_is_accepted_when_high_quality_was_requested() {
+        let value = manifest("audio/mp4", "mp4a.40.2");
+        validate_requested_quality(AudioQuality::High, AudioQuality::High, &value, "test").unwrap();
+        assert_eq!(value.get_file_extension(), Some("m4a"));
     }
 }

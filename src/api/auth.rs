@@ -1,6 +1,6 @@
 use super::build_http_client;
 use super::models::*;
-use crate::config::{ApiKey, CONFIG};
+use crate::config::{AuthProfile, CONFIG};
 use anyhow::anyhow;
 use anyhow::Error;
 use reqwest::Client;
@@ -14,13 +14,13 @@ pub struct AuthClient {
 }
 
 impl AuthClient {
-    pub fn new(config: ApiKey) -> Self {
-        Self {
-            client_id: config.client_id,
-            client_secret: config.client_secret,
+    pub fn new(profile: AuthProfile) -> Result<Self, Error> {
+        Ok(Self {
+            client_id: profile.client_id.clone(),
+            client_secret: profile.client_secret.clone(),
             auth_base: "https://auth.tidal.com/v1/oauth2".to_string(),
-            http: build_http_client(),
-        }
+            http: build_http_client(&profile)?,
+        })
     }
 
     pub async fn get_device_code(&self) -> Result<DeviceAuthResponse, Error> {
@@ -179,5 +179,40 @@ impl AuthClient {
         }
         let res = serde_json::from_slice::<RefreshResponse>(&body)?;
         Ok(res)
+    }
+
+    pub async fn exchange_pkce_code(
+        &self,
+        code: &str,
+        code_verifier: &str,
+        client_unique_key: &str,
+        redirect_uri: &str,
+    ) -> Result<RefreshResponse, Error> {
+        let data = [
+            ("code", code),
+            ("client_id", self.client_id.as_str()),
+            ("grant_type", "authorization_code"),
+            ("redirect_uri", redirect_uri),
+            ("scope", "r_usr+w_usr+w_sub"),
+            ("code_verifier", code_verifier),
+            ("client_unique_key", client_unique_key),
+        ];
+        let response = self
+            .http
+            .post(format!("{}/token", self.auth_base))
+            .form(&data)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        if !status.is_success() {
+            let error_name = serde_json::from_slice::<OAuthErrorResponse>(&body)
+                .map(|error| error.error)
+                .unwrap_or_else(|_| "unknown_oauth_error".to_string());
+            return Err(anyhow!(
+                "PKCE token exchange failed: {error_name} (HTTP {status})"
+            ));
+        }
+        Ok(serde_json::from_slice::<RefreshResponse>(&body)?)
     }
 }
